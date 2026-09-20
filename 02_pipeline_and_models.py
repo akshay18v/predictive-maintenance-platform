@@ -12,8 +12,17 @@ from sklearn.metrics import (
     precision_score,
     recall_score,
 )
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.preprocessing import StandardScaler
+
+# =============================================================
+# 0. GLOBAL REPRODUCIBILITY SEED
+# =============================================================
+SEED = 42
+np.random.seed(SEED)
+
+COST_FN = 1000  # $1,000 for missed breakdown (Unplanned downtime)
+COST_FP = 100   # $100 for false alarm inspection (Labor cost)
 
 # =============================================================
 # PART 1: LOAD TELEMETRY FROM SQLITE
@@ -28,7 +37,6 @@ print(f"Loaded {len(df)} records from UCI AI4I 2020 dataset.\n")
 # PART 2: STATISTICAL HYPOTHESIS TESTING
 # =============================================================
 print("--- 2. Running Inferential Hypothesis Tests ---")
-
 healthy_torque = df[df["Machine_failure"] == 0]["Torque_Nm"]
 failed_torque = df[df["Machine_failure"] == 1]["Torque_Nm"]
 
@@ -54,17 +62,17 @@ df["Strain_Index"] = df["Torque_Nm"] * df["Tool_wear_min"]
 print("Engineered: 'Power_Watts', 'Temp_Diff_K', 'Strain_Index'.\n")
 
 # =============================================================
-# PART 4: K-MEANS REGIMES & ISOLATION FOREST
+# PART 4: K-MEANS REGIMES & ISOLATION FOREST (SEEDED)
 # =============================================================
 print("--- 4. Unsupervised Regimes & Anomaly Detection ---")
 regime_cols = ["Rotational_speed_rpm", "Torque_Nm", "Tool_wear_min", "Power_Watts"]
 scaler = StandardScaler()
 scaled_regimes = scaler.fit_transform(df[regime_cols])
 
-kmeans = KMeans(n_clusters=3, random_state=42, n_init=10)
+kmeans = KMeans(n_clusters=3, random_state=SEED, n_init=10)
 df["Operating_Regime"] = kmeans.fit_predict(scaled_regimes)
 
-iso_forest = IsolationForest(contamination=0.035, random_state=42)
+iso_forest = IsolationForest(contamination=0.034, random_state=SEED)
 iso_preds = iso_forest.fit_predict(scaled_regimes)
 df["Is_Anomaly"] = np.where(iso_preds == -1, 1, 0)
 
@@ -72,10 +80,10 @@ iso_precision = precision_score(df["Machine_failure"], df["Is_Anomaly"])
 iso_recall = recall_score(df["Machine_failure"], df["Is_Anomaly"])
 print(f"Isolation Forest (Unsupervised Baseline):")
 print(f"  - Precision: {iso_precision:.4f} | Recall: {iso_recall:.4f}")
-print(f"  - Lift over random guess (3.4% base rate): ~{iso_precision / 0.034:.1f}x\n")
+print(f"  - Lift over base rate (3.39%): ~{iso_precision / 0.0339:.1f}x\n")
 
 # =============================================================
-# PART 5: 3-WAY SPLIT (TRAIN: 70%, VAL: 15%, TEST: 15%)
+# PART 5: UNBIASED SPLIT (85% DEV, 15% HELD-OUT TEST)
 # =============================================================
 raw_sensor_cols = [
     "Air_temperature_K", "Process_temperature_K", "Rotational_speed_rpm",
@@ -88,100 +96,135 @@ all_feature_cols = raw_sensor_cols + [
 X = df[all_feature_cols]
 y = df["Machine_failure"]
 
-# Split 1: 70% Train, 30% Temp (Val + Test)
-X_train, X_temp, y_train, y_temp = train_test_split(
-    X, y, test_size=0.30, random_state=42, stratify=y
-)
-# Split 2: Divide the 30% equally into 15% Validation and 15% Test
-X_val, X_test, y_val, y_test = train_test_split(
-    X_temp, y_temp, test_size=0.50, random_state=42, stratify=y_temp
+X_dev, X_test, y_dev, y_test = train_test_split(
+    X, y, test_size=0.15, random_state=SEED, stratify=y
 )
 
-print(f"Split sizes -> Train: {len(X_train)}, Validation: {len(X_val)}, Test: {len(X_test)}")
+print(f"Dataset split -> Development: {len(X_dev)} records ({y_dev.sum()} failures)")
+print(f"                 Test (Held-Out): {len(X_test)} records ({y_test.sum()} failures)\n")
 
 # =============================================================
-# PART 6: REAL BASELINE VS. PHYSICS-ENRICHED MODEL
+# PART 6: STRATIFIED 5-FOLD CV (OOF BENCHMARKING)
 # =============================================================
-print("\n--- 5. Training Models & Benchmarking ---")
+print("--- 5. Cross-Validated Training & Threshold Optimization ---")
+skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
 
-# Baseline Model: Trained on RAW sensor features only
-rf_baseline = RandomForestClassifier(
-    n_estimators=150, max_depth=8, class_weight="balanced", random_state=42
-)
-rf_baseline.fit(X_train[raw_sensor_cols], y_train)
-val_probs_base = rf_baseline.predict_proba(X_val[raw_sensor_cols])[:, 1]
-p_base, r_base, _ = precision_recall_curve(y_val, val_probs_base)
+oof_probs_baseline = np.zeros(len(X_dev))
+oof_probs_prod = np.zeros(len(X_dev))
+
+for train_idx, val_idx in skf.split(X_dev, y_dev):
+    X_f_train, X_f_val = X_dev.iloc[train_idx], X_dev.iloc[val_idx]
+    y_f_train, y_f_val = y_dev.iloc[train_idx], y_dev.iloc[val_idx]
+    
+    # Baseline Model: Raw Sensors Only
+    rf_b = RandomForestClassifier(
+        n_estimators=150, max_depth=8, class_weight="balanced", random_state=SEED
+    )
+    rf_b.fit(X_f_train[raw_sensor_cols], y_f_train)
+    oof_probs_baseline[val_idx] = rf_b.predict_proba(X_f_val[raw_sensor_cols])[:, 1]
+    
+    # Production Model: Raw + Physics
+    rf_p = RandomForestClassifier(
+        n_estimators=150, max_depth=8, class_weight="balanced", random_state=SEED
+    )
+    rf_p.fit(X_f_train, y_f_train)
+    oof_probs_prod[val_idx] = rf_p.predict_proba(X_f_val)[:, 1]
+
+# PR-AUC Calculation
+p_base, r_base, _ = precision_recall_curve(y_dev, oof_probs_baseline)
 baseline_pr_auc = auc(r_base, p_base)
 
-# Production Model: Trained on RAW + PHYSICS + REGIME features
-rf_model = RandomForestClassifier(
-    n_estimators=150, max_depth=8, class_weight="balanced", random_state=42
-)
-rf_model.fit(X_train, y_train)
-val_probs = rf_model.predict_proba(X_val)[:, 1]
-p_rf, r_rf, _ = precision_recall_curve(y_val, val_probs)
-production_pr_auc = auc(r_rf, p_rf)
+p_prod, r_prod, _ = precision_recall_curve(y_dev, oof_probs_prod)
+prod_pr_auc = auc(r_prod, p_prod)
 
-print(f"Baseline (Raw Sensors Only) PR-AUC:       {baseline_pr_auc:.4f}")
-print(f"Production (+ Physics Features) PR-AUC:   {production_pr_auc:.4f}")
-print(f"Proven Feature Engineering Lift:          +{production_pr_auc - baseline_pr_auc:.4f}")
+print(f"5-Fold OOF Baseline PR-AUC (Raw Sensors):      {baseline_pr_auc:.4f}")
+print(f"5-Fold OOF Production PR-AUC (+ Physics):       {prod_pr_auc:.4f}")
+print(f"Verified Feature Engineering Lift:             +{prod_pr_auc - baseline_pr_auc:.4f}\n")
 
 # =============================================================
-# PART 7: THRESHOLD TUNING ON VALIDATION DATA (NO LEAKAGE)
+# PART 7: EXPLICIT COST MATRIX THRESHOLD SEARCH
 # =============================================================
-print("\n--- 6. Tuning Cost Threshold on Validation Set ---")
-COST_FN = 1000  # $1,000 for missed breakdown
-COST_FP = 100   # $100 for false alarm inspection
+print(f"Running Threshold Optimization (FN Cost: ${COST_FN}, FP Cost: ${COST_FP})...")
 
 threshold_candidates = np.linspace(0.10, 0.90, 81)
-val_costs = []
+oof_costs = []
 
 for t in threshold_candidates:
-    preds = (val_probs >= t).astype(int)
-    fn = np.sum((y_val == 1) & (preds == 0))
-    fp = np.sum((y_val == 0) & (preds == 1))
-    val_costs.append((fn * COST_FN) + (fp * COST_FP))
+    preds = (oof_probs_prod >= t).astype(int)
+    fn = int(np.sum((y_dev == 1) & (preds == 0)))
+    fp = int(np.sum((y_dev == 0) & (preds == 1)))
+    cost = (fn * COST_FN) + (fp * COST_FP)
+    oof_costs.append(cost)
 
-best_idx = np.argmin(val_costs)
+# Compute default 0.50 cost on OOF
+default_oof_preds = (oof_probs_prod >= 0.50).astype(int)
+default_fn_oof = int(np.sum((y_dev == 1) & (default_oof_preds == 0)))
+default_fp_oof = int(np.sum((y_dev == 0) & (default_oof_preds == 1)))
+default_oof_cost = (default_fn_oof * COST_FN) + (default_fp_oof * COST_FP)
+
+best_idx = np.argmin(oof_costs)
 optimal_threshold = float(threshold_candidates[best_idx])
-print(f"Selected Optimal Threshold on Validation Set: {optimal_threshold:.2f}")
+optimal_oof_cost = oof_costs[best_idx]
+
+print(f"OOF Cost at Default 0.50: ${default_oof_cost:,} (FN: {default_fn_oof}, FP: {default_fp_oof})")
+print(f"OOF Cost at Tuned {optimal_threshold:.2f}:   ${optimal_oof_cost:,} (Savings on Dev: ${default_oof_cost - optimal_oof_cost:,})")
 
 # =============================================================
-# PART 8: HONEST FINAL EVALUATION ON UNSEEN TEST SET
+# PART 8: FINAL PRODUCTION MODEL & FROZEN TEST EVALUATION
 # =============================================================
-print("\n--- 7. Final Unbiased Evaluation on Test Set ---")
-test_probs = rf_model.predict_proba(X_test)[:, 1]
+print("\n--- 6. Final Blind Test Set Evaluation ---")
+final_model = RandomForestClassifier(
+    n_estimators=150, max_depth=8, class_weight="balanced", random_state=SEED
+)
+final_model.fit(X_dev, y_dev)
+
+test_probs = final_model.predict_proba(X_test)[:, 1]
+
+# 1. Performance at Tuned Threshold
 test_preds = (test_probs >= optimal_threshold).astype(int)
-
 cm = confusion_matrix(y_test, test_preds)
-test_precision = precision_score(y_test, test_preds)
-test_recall = recall_score(y_test, test_preds)
+test_precision = precision_score(y_test, test_preds, zero_division=0)
+test_recall = recall_score(y_test, test_preds, zero_division=0)
+test_cost = int((cm[1][0] * COST_FN) + (cm[0][1] * COST_FP))
 
-test_cost = (cm[1][0] * COST_FN) + (cm[0][1] * COST_FP)
+# 2. Performance at Default 0.50 Threshold
 default_preds = (test_probs >= 0.50).astype(int)
 cm_default = confusion_matrix(y_test, default_preds)
-default_cost = (cm_default[1][0] * COST_FN) + (cm_default[0][1] * COST_FP)
+default_precision = precision_score(y_test, default_preds, zero_division=0)
+default_recall = recall_score(y_test, default_preds, zero_division=0)
+default_cost = int((cm_default[1][0] * COST_FN) + (cm_default[0][1] * COST_FP))
 
-print(f"Test Confusion Matrix at Locked Threshold {optimal_threshold:.2f}:")
-print(f"  True Negatives (Safe):         {cm[0][0]}")
-print(f"  False Positives (Inspections): {cm[0][1]}")
-print(f"  False Negatives (Missed):      {cm[1][0]}")
-print(f"  True Positives (Caught):       {cm[1][1]}")
-print(f"Test Precision: {test_precision:.4f} | Test Recall: {test_recall:.4f}")
-print(f"Total Incurred Cost on Test Set: ${test_cost:,} (vs. ${default_cost:,} at default 0.50)")
+print(f"Test Evaluation at Tuned Threshold ({optimal_threshold:.2f}):")
+print(f"  Confusion Matrix: TN={cm[0][0]}, FP={cm[0][1]}, FN={cm[1][0]}, TP={cm[1][1]}")
+print(f"  Precision: {test_precision:.4f} | Recall: {test_recall:.4f}")
+print(f"  Incurred Cost: ${test_cost:,}")
+
+print(f"\nTest Evaluation at Default Threshold (0.50):")
+print(f"  Confusion Matrix: TN={cm_default[0][0]}, FP={cm_default[0][1]}, FN={cm_default[1][0]}, TP={cm_default[1][1]}")
+print(f"  Precision: {default_precision:.4f} | Recall: {default_recall:.4f}")
+print(f"  Incurred Cost: ${default_cost:,}")
 
 # =============================================================
-# PART 9: SAVE ARTIFACTS
+# PART 9: SAVE PRODUCTION ARTIFACTS
 # =============================================================
 artifacts = {
-    "model": rf_model,
+    "model": final_model,
     "feature_cols": all_feature_cols,
     "optimal_threshold": optimal_threshold,
+    "baseline_pr_auc": baseline_pr_auc,
+    "prod_pr_auc": prod_pr_auc,
+    "test_metrics": {
+        "precision": test_precision,
+        "recall": test_recall,
+        "cm": cm.tolist(),
+        "cost": test_cost,
+        "default_cost": default_cost
+    }
 }
 joblib.dump(artifacts, "model_artifact.joblib")
-print("\nSaved serialized model bundle to 'model_artifact.joblib'.")
+print("\n[SUCCESS] Saved serialized production model to 'model_artifact.joblib'")
 
 conn = sqlite3.connect("data/maintenance.db")
 df.to_sql("machine_telemetry_final", conn, if_exists="replace", index=False)
 conn.close()
-print("Saved enriched telemetry to SQLite table 'equipment_telemetry_final'.")
+print("[SUCCESS] Enriched telemetry saved to SQLite table 'machine_telemetry_final'.")
